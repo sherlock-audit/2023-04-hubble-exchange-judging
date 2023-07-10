@@ -141,7 +141,7 @@ def process_directory(repo, path):
 
         for file in files:
             file = ContentFileExtended.cast(file)
-            if "best" in file.name or len(files) == 1:
+            if "best" in file.name:
                 issue_id = int(file.name.replace("-best.md", ""))
                 parent = issue_id
             else:
