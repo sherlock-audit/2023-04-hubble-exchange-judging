@@ -141,11 +141,14 @@ def process_directory(repo, path):
 
         for file in files:
             file = ContentFileExtended.cast(file)
-            if "best" in file.name or len(files) == 1:
-                issue_id = int(file.name.replace("-best.md" if "best" in file.name else "", ""))
+            if "best" in file.name:
+                issue_id = int(file.name.replace("-best.md", ""))
                 parent = issue_id
             else:
                 issue_id = int(file.name.replace(".md", ""))
+            
+            if len(files) == 1:
+                parent = issue_id
             
             body = file.decoded_content.decode("utf-8")
             auditor = body.split("\n")[0]
