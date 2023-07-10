@@ -149,7 +149,7 @@ def process_directory(repo, path):
             
             if len(files) == 1:
                 parent = issue_id
-            
+                
             body = file.decoded_content.decode("utf-8")
             auditor = body.split("\n")[0]
             issue_title = re.match(r"^(?:[#\s]+)(.*)$", body.split("\n")[4]).group(1)
