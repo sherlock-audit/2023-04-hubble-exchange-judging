@@ -1,95 +1,78 @@
-# Issue H-1: First depositor can break minting of shares 
+# Issue H-1: ProcessWithdrawals is still DOS-able 
 
-Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/140 
+Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/116 
 
 ## Found by 
-0x3e84fa45, 0x52, 0xDjango, 0xvj, BugHunter101, bitsurfer, carrotsmuggler, lemonmon, p12473, qbs, rogue-lion-0619
+0x3e84fa45, 0x52, 0xDjango, 0xbepresent, carrotsmuggler, dirk\_y, kutugu, p12473, qbs, qckhp, rogue-lion-0619
 ## Summary
-The common "first depositor" vulnerability is found in `InsuranceFund.depositFor()`. The first account to deposit into the insurance fund can steal value from subsequent depositors by:
 
-- Minting `1 wei` shares
-- Directly transferring assets into the contract to inflate the `poolValue`
-- Subsequent depositors deposit assets but are minted `0 shares` due to precision loss
-- First depositor steals the assets
+[DOS on process withdrawals](https://github.com/code-423n4/2022-02-hubble-findings/issues/119) were reported in the previous code4rena audit however the fix does not actually stop DOS, it only makes it more expensive. There is a much cheaper way to DOS the withdrawal queue - that is by specifying the `usr` to be a smart contract that consumes all the gas. 
 
 ## Vulnerability Detail
-The depositor's shares are calculated via:
 
 ```solidity
-        if (_pool == 0) {
-            shares = amount;
-        } else {
-            shares = amount * _totalSupply / _pool;
-        }
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.9;
+import "./Utils.sol";
+
+contract MaliciousReceiver {
+    uint256 public gas;
+    receive() payable external {
+        gas = gasleft();
+        for(uint256 i = 0; i < 150000; i++) {} // 140k iteration uses about 28m gas. 150k uses slightly over 30m.
+    }
+}
+
+contract VUSDWithReceiveTest is Utils {
+    event WithdrawalFailed(address indexed trader, uint amount, bytes data);
+
+    function setUp() public {
+        setupContracts();
+    }
+
+    function test_CannotProcessWithdrawals(uint128 amount) public {
+        MaliciousReceiver r = new MaliciousReceiver();
+
+        vm.assume(amount >= 5e6);
+        // mint vusd for this contract
+        mintVusd(address(this), amount);
+        // alice and bob also mint vusd
+        mintVusd(alice, amount);
+        mintVusd(bob, amount);
+
+        // withdraw husd
+        husd.withdraw(amount);      // first withdraw in the array
+        vm.prank(alice);
+        husd.withdraw(amount);
+        vm.prank(bob);              // Bob is the malicious user and he wants to withdraw the VUSD to his smart contract
+        husd.withdrawTo(address(r), amount);
+
+        assertEq(husd.withdrawalQLength(), 3);
+        assertEq(husd.start(), 0);
+
+        husd.processWithdrawals();  // This doesn't fail on foundry because foundry's gas limit is way higher than ethereum's. 
+
+        uint256 ethereumSoftGasLimit = 30_000_000;
+        assertGt(r.gas(), ethereumSoftGasLimit); // You can only transfer at most 63/64 gas to an external call and the fact that the recorded amt of gas is > 30m shows that processWithdrawals will always revert when called on mainnet. 
+    }
+
+    receive() payable external {
+        assertEq(msg.sender, address(husd));
+    }
+}
 ```
 
-Upon first deposit, the `_pool` value will be 0. The attacker will transact with an `amount` = `1 wei` to mint 1 wei of shares. Then the attacker will transfer some value of asset directly to the contract. For this example, the attacker transfers 10,000 USDC.
+Copy and paste this file into the test/foundry folder and run it.
 
-Next, a subsequent depositor attempts to mint shares with 5,000 VUSD.
-
-`shares = 5000 ether * 1 wei / 10,000 ether = 0` due to precision loss.
-
-The attacker can now withdraw the second depositor's assets.
-
-## Impact
-- Theft of deposits
-
-## Code Snippet
-https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/InsuranceFund.sol#L104-L108
-
-## Tool used
-Manual Review
-
-## Recommendation
-Mint a certain number of shares and transfer them to address(0) within the `initialize()` function.
-
-
-
-## Discussion
-
-**asquare08**
-
-This issue was already mentioned in[ code arena audit](https://github.com/code-423n4/2022-02-hubble-findings/issues/42). As done in v1, this will be fixed by adding the initial amount to the insurance fund from Hubble at the time of deployment.
-
-# Issue H-2: Malicious user can grief withdrawing users via VUSD reentrancy 
-
-Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153 
-
-## Found by 
-0x3e84fa45, 0x52, 0xDjango, 0xbepresent, carrotsmuggler, dirk\_y, kutugu, lil.eth, p-tsanev, p12473, qckhp
-## Summary
-
-VUSD#processWithdraw makes a call to withdrawal.usr to send the withdrawn gas token. processWithdrawals is the only nonreentrant function allowing a user to create a smart contract that uses it's receive function to deposit then immediately withdraw to indefinitely lengthen the withdrawal queue and waste large amounts of caller gas.
-
-## Vulnerability Detail
-
-[VUSD.sol#L69-L77](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L69-L77)
-
-        while (i < withdrawals.length && (i - start) < maxWithdrawalProcesses) {
-            Withdrawal memory withdrawal = withdrawals[i];
-            if (reserve < withdrawal.amount) {
-                break;
-            }
-
-            (bool success, bytes memory data) = withdrawal.usr.call{value: withdrawal.amount}("");
-            if (success) {
-                reserve -= withdrawal.amount;
-
-To send the withdrawn gas token to the user VUSD#processWithdrawals utilizes a call with no data. When received by a contract this will trigger it's receive function. This can be abused to continually grief users who withdraw with no recurring cost to the attacker. To exploit this the attacker would withdraw VUSD to a malicious contract. This contract would deposit the received gas token then immediately withdraw it. This would lengthen the queue. Since the queue is first-in first-out a user would be forced to process all the malicious withdrawals before being able to process their own. While processing them they would inevitably reset the grief for the next user.
-
-NOTE: I am submitting this as a separate issue apart from my other two similar issues. I believe it should be a separate issue because even though the outcome is similar the root cause is entirely different. Those are directly related to the incorrect call parameters while the root cause of this issue is that both mintWithReserve and withdraw/withdrawTo lack the reentrant modifier allowing this malicious reentrancy.
+The test **will not fail** because foundry has a [very high gas limit](https://book.getfoundry.sh/reference/config/testing?#gas_limit) but you can see from the test that the amount of gas that was recorded in the malicious contract is higher than 30m (which is the [current gas limit on ethereum](https://ethereum.org/en/developers/docs/gas/#:~:text=Block%20size,-Before%20the%20London&text=The%20London%20Upgrade%20introduced%20variable,2x%20the%20target%20block%20size)). If you ran the test by specifying the —gas-limit i.e. `forge test -vvv --match-path test/foundry/VUSDRevert.t.sol --gas-limit 30000000` The test will fail with `Reason: EvmError: OutOfGas` because there is not enough gas to transfer to the malicious contract to run 150k iterations.
 
 ## Impact
 
-Malicious user can maliciously reenter VUSD to grief users via unnecessary gas wastage 
+Users will lose their funds and have their VUSD burnt forever because nobody is able to process any withdrawals.
 
 ## Code Snippet
 
-[VUSD.sol#L45-L48](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L45-L48)
-
-[VUSD.sol#L50-L52](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L50-L52)
-
-[VUSD.sol#L58-L60](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L58-L60)
+https://github.com/hubble-exchange/hubble-protocol/blob/d89714101dd3494b132a3e3f9fed9aca4e19aef6/contracts/VUSD.sol#L65-L85
 
 ## Tool used
 
@@ -97,75 +80,93 @@ Manual Review
 
 ## Recommendation
 
-Add the nonreentrant modifer to mintWithReserve withdraw and withdrawTo
+From best recommendation to worst
+
+1. Remove the queue and withdraw the assets immediately when `withdraw` is called.
+2. Allow users to process withdrawals by specifying the index index
+3. Allow the admin to remove these bad withdrawals from the queue
+4. Allow the admin to adjust the start position to skip these bad withdrawals.
+
 
 
 
 ## Discussion
 
-**asquare08**
+**P12473**
 
-Will add the `nonreentrant` modifer to `mintWithReserve` withdraw and `withdrawTo`
+Escalate
+
+I think we should differentiate between a temporary DOS like #153 vs a permanent DOS like my issue (and a few others that are marked as dups of #153 e.g. #57) and the fix suggested by #153 does not fix our vulnerability.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> I think we should differentiate between a temporary DOS like #153 vs a permanent DOS like my issue (and a few others that are marked as dups of #153 e.g. #57) and the fix suggested by #153 does not fix our vulnerability.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 **ctf-sec**
 
->To exploit this the attacker would withdraw VUSD to a malicious contract. This contract would deposit the received gas token then immediately withdraw it. 
+Please check:
 
-I put this issue and #160 together because these two issue highlight different ways of wasting gas, but they also focus on how to waste gas in external call.
+https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153#issuecomment-1643620806
 
-Recommend checking #160 as well.
+**P12473**
 
-and I leave the #158 as a separate issue because the root cause is the returned call data is emitted in the contract code itself
+> Please check:
+> 
+> [#153 (comment)](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153#issuecomment-1643620806)
 
-**asquare08**
+The lack of reentrancy guards does not prevent the attack vector mentioned here. I see 3 broad categorization of issues that can DOS the processWithdraw function. 
 
-yes noted. #160 has slightly different cause but same effect. So the solution for all these related issues is
-* don't save data in variable #158 
-* cap the gas limit of .call #160
-* [this](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153#issuecomment-1640346418)
+| Vulnerability | Issues | Effect |
+| -- | -- | -- |
+| Consuming more than the max allowed gas limit of the network | #116, #57, #138, #160, #191, #215, #158* | permanent DOS, single call |
+| Cross functional reentrancy | #153, #195 | temporary DOS, single call |
+| Spamming the withdrawal queue | everything else | temporary DOS, multiple call |
 
+Please note that this issue (and all its dups) will break the `processWithdrawal` function entirely and forever. You cannot undo it because there is no way to process a withdrawal transaction that consumes more gas than is maximally allowed in a single block e.g. 30m on ethereum, 15m on avalanche.
 
-# Issue H-3: Malicious user can permanently break VUSD#processWithdrawals by returning huge amounts of data 
+\* I have also grouped #158 together because it is effectively the same thing i.e. the miners cannot process the withdrawal because it consumes too much gas (either from loading too much memory or from trying to execute a million iterations of a loop).
 
-Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/158 
+**ctf-sec**
 
-## Found by 
-0x52, qbs, rogue-lion-0619
-## Summary
+This issues just outline an different way to waste gas in external call
 
-VUSD#processWithdraw makes a call to withdrawal.usr to send the withdrawn gas token. It then stores the return data of the call in memory. A malicious user could set the withdrawal target to a malicious contract that would return an extremely large data amount that would guaranteed cause an OOG error when loaded to memory. The result is that all withdrawals would be permanently locked causing massive loss to all VUSD holders.
+Recommend maintaining the original duplication because the issue are grouped by root cause, not by fix or impact
 
-NOTE: I am submitting this as a separate issue apart from my other two similar issues. I believe it should be a separate issue because even though the outcome is similar the root cause is different. The vulnerability exploited in this issue is that the return data is stored and that there is no cap on it's size. Capping the gas usage of the call won't fix this.
+**hrishibhat**
 
-## Vulnerability Detail
+Result:
+High
+Has duplicates
+While I agree given the nature of the issues around external `.call` and out-of-gas-related issues in the `processWithdrawals` function, there could have been multiple versions of duplications. 
+Tend to agree with the analysis made in this comment [here](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/116#issuecomment-1643976730).
+After looking at all the issues and considering the attack vectors mentioned, based on the [Sherlock rules](https://docs.sherlock.xyz/audits/judging/judging#duplication-rules) this is the version of duplication that was concluded:
+- 1. Issues that result in a user being a malicious contract that consumes all gas during `processWithdrawals`
+#116, #57, #138, #160, #191, #215, #158, #122, #96, #95, #127, #198
+- 2. Griefing due to cross-functional reentrancy 
+#153, #195
+- 3. DOS due to large withdrawal requests
+#81, #94, #15
 
-See summary.
-
-## Impact
-
-All withdrawals can be permanently broken
-
-## Code Snippet
-
-[VUSD.sol#L65-L85](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L65-L85)
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Cap the data returned or don't store the return data at all
+Note:
+I agree that there may be other duplication sets based on the interpretations of the duplication rules, but this is the one I decided to go with and consider fair. 
 
 
+**sherlock-admin2**
 
-## Discussion
+Escalations have been resolved successfully!
 
-**asquare08**
+Escalation status:
+- [p12473](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/116/#issuecomment-1643012093): accepted
 
-will remove saving the return data in `.call`, not needed.
-
-# Issue H-4: Failed withdrawals from VUSD#processWithdrawals will be lost forever 
+# Issue H-2: Failed withdrawals from VUSD#processWithdrawals will be lost forever 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/162 
 
@@ -213,7 +214,7 @@ Cache failed withdrawals and allow them to be retried or simply send VUSD to the
 
 will add functionality to retry withdrawals
 
-# Issue H-5: Rogue validators can manipulate funding rates and profit unfairly from liquidations 
+# Issue H-3: Rogue validators can manipulate funding rates and profit unfairly from liquidations 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183 
 
@@ -261,6 +262,156 @@ The methodology of order matching needs to be rethought to force validators to m
 
 We will fix this with post-mainnet releases. Initially, we are launching with a trusted, closed set of validators and will fix this before we open for public validators. 
 Remarks about point 2. Manipulation of funding rate - for this to happen, a validator will need to place and execute orders for a fairly large amount of time if there are other trades in the system. So this scenario can happen in case of low liquidity in the system. 
+
+**P12473**
+
+Escalate
+
+This should not be a high because validators in hubble are [decided by the governance](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/orderbooks/OrderBook.sol#L533-L535) which is different from the validators who secure the hubble network.
+
+For this exploit to occur, an existing validator needs to be compromised or a rogue validator added by manipulating the governance vote. Moreover, this attack assumes that there is only 1 validator when there can be multiple non rogue validators matching orders as well.
+
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> This should not be a high because validators in hubble are [decided by the governance](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/orderbooks/OrderBook.sol#L533-L535) which is different from the validators who secure the hubble network.
+> 
+> For this exploit to occur, an existing validator needs to be compromised or a rogue validator added by manipulating the governance vote. Moreover, this attack assumes that there is only 1 validator when there can be multiple non rogue validators matching orders as well.
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**djb15**
+
+I agree with this escalation. Regarding the manipulation of the funding rate see https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/100#issuecomment-1640389572 which is acknowledged as a low severity issue because you just need 1 non-malicious validator. I believe the same is true for this report where one non malicious validator would prevent the funding rate being manipulated over a significant period of time (in normal market conditions).
+
+EDIT: See https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/87#issuecomment-1644045278 for some related justification 
+
+**ctf-sec**
+
+In the part funding manipulation yes
+
+but the attacker vector does not require all validator to be malicious, one malicious validator can do this and extract value from user.
+
+> Profiting unfairly from liquidation. Assume the current mark price for WETH is 2000. A user is liquidated and 100 ETH needs to be sold. Assume there are available orders that can match this liquidation at 2000. Instead of matching it directly, the validator can create his own order at 1980 and match the liquidation to his own order. He can then immediately sell and match with the other available orders for a profit of 2,000 (20 * 100) USDC.
+
+Recommend maintaining high severity
+
+**djb15**
+
+That's a fair point, I've found the following quote from the sponsor in the discord channel (https://discord.com/channels/812037309376495636/1121092175216787507/1126818439646957628):
+
+> So, in that sense and from the perspective of the smart contract audit, validators are not trusted.
+
+So I agree the "profit unfairly from liquidations" part of this report is probably a valid high as I agree you only need 1 malicious validator. But the "manipulating funding rates part" is probably a medium as you would need either lots of malicious validators in normal market conditions or 1 malicious validator in low liquidity market conditions. So high overall :D
+
+**IAm0x52**
+
+The validators aren't different, they are the same. The concept that governance would restrict validators to a trusted set is new information that was never present in any of the docs or readme during the contest. All information indicated that validators would be open and decentralized. Based on that information anyone could be a validator which is why I think this should remain as a high risk issue.
+
+#87 should not be a dupe of this issue. Realistically I shouldn't have submitted this as a single issue and should have submitted it as two. One for liquidation manipulation and the other for the funding rate manipulation. Since a single issue can't be a dupe of two different issues, this should remain a separate issue.
+
+**P12473**
+
+> The validators aren't different, they are the same.
+
+If they are the same and any validators of the network can participate in matching orders, then why was this information not communicated to us on the docs or the README?
+
+Can you please show me an example of a smart contract on AVAX C-Chain with a protected "validator" role in the smart contract and yet any of the validators of AVAX consensus layer can pass that check.
+
+More generally, should vulnerabilities regarding information that was not communicated to us be also considered valid? This encompasses literally everything, and you start to go into the world of crazy hypothetical what-ifs. @hrishibhat 
+
+> All information indicated that validators would be open and decentralized. 
+
+The README clearly states that there is a governance role which is a TRUSTED role. All actions of a trusted role should be trusted hence one would assume that who the governance selects as validators are to be trusted.
+
+If this premise is wrong, then one can go so far as to generalise that all privileged roles cannot be trusted because there is a non-zero chance that they will go rogue / fall in the hands of the wrong people.
+
+> Realistically I shouldn't have submitted this as a single issue and should have submitted it as two. One for liquidation manipulation and the other for the funding rate manipulation.
+
+Both liquidation manipulation and funding rate manipulation is predicated on the assumption that rogue validators [were selected to match orders by the governance](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/orderbooks/OrderBook.sol#L533-L535).
+
+Liquidation manipulation also assumes that: 
+
+1. there are no other honest validators to match this user.
+2. the rogue validator of the smart contract also controls a substantial AVAX stake as a node at the consensus layer in order to ensure that his orders are finalized.
+
+As described by the sponsor, funding rate manipulation can only occur when there is low liquidity. When there is high liquidity, manipulating the TWAP price will be too expensive just to extract funding from users. In many past contests, a comment like this by the sponsor would immediately invalidate the report.
+
+It is also by design that if the system has low liquidity, the funding paid by the user will be high. The onus should be on the user to close his position.
+
+> Since a single issue can't be a dupe of two different issues, this should remain a separate issue.
+
+Lol I'm gonna start grouping all my issues together too because multiple issues cant be a dup of a single issue. 🤷🏼‍♂️ 
+
+
+**IAm0x52**
+
+> If they are the same and any validators of the network can participate in matching orders, then why was this information not communicated to us on the docs or the README
+
+All network validators have to be added by governance or else there would be a lot of empty blocks because the unverified block producers wouldn't be able to match any orders. Fundamentally they have to be the same.
+
+> there are no other honest validators to match this user.
+
+This statement is incorrect. When it is this validator's turn to produce the block they will be able to abuse this.
+
+> the rogue validator of the smart contract also controls a substantial AVAX stake as a node at the consensus layer in order to ensure that his orders are finalized.
+
+Also incorrect. If you would read my issue, abusing liquidations in this way doesn't break any consensus rules and therefore would be accepted by honest validators.
+
+> Both liquidation manipulation and funding rate manipulation is predicated on the assumption that rogue validators [were selected to match orders by the governance](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/orderbooks/OrderBook.sol#L533-L535).
+
+Incorrect again. Anyone, not just validators, can manipulate funding rate as demonstrated by #87. Hence why this is two separate issues.
+
+> Lol I'm gonna start grouping all my issues together too because multiple issues cant be a dup of a single issue. 🤷🏼‍♂️
+
+Yet another incorrect statement. In this scenario I receive less of the prize pool not more.
+
+**hrishibhat**
+
+@P12473 I think the above [response](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1661280730) makes sense. 
+do you have further comments?
+
+**P12473**
+
+> @P12473 I think the above [response](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1661280730) makes sense. do you have further comments?
+
+Thanks for giving me this opportunity to speak but I do not have any comments.
+
+@IAm0x52 is a much better auditor than I am and it is most likely that I am wrong. I want to understand his perspective but I am unable to do so from his explanation. If you agree with his take then I will rest my case.
+
+I only hope that the decision was an impartial one. Thanks again!
+
+**asquare08**
+
+For the scope of this audit, validators should not be trusted. However, we'll launch on mainnet with a closed set of trusted validators and plan to open for public validators later.
+So, point 1 (liquidation) is a valid high issue as it can happen even if 1 validator is malicious and point 2 (funding payment) is a valid medium issue as it can happen only in low liquidity case and will also be costly to do so.
+
+**hrishibhat**
+
+Result:
+High
+Unique
+Considering this issue a valid high based on the discussion above and Sponsor's [comment](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1665745210)
+
+Additionally, the [readme](https://github.com/sherlock-audit/2023-04-hubble-exchange#q-are-there-any-additional-protocol-roles-if-yes-please-explain-in-detail) shared information about the trusted protocol roles were limited to the governance. 
+And the docs provided context on the validators and their functioning:
+https://medium.com/hubbleexchange/introducing-hubble-exchange-a-purpose-built-chain-for-perps-25c60db66d44
+https://hubbleexchange.notion.site/Hubble-Exchange-Overview-e9487ec19fe9451c9d445be15978c740
+
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [p12473](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183/#issuecomment-1642958328): rejected
 
 # Issue M-1: Risk of Unfair Order Execution Price in `_validateOrdersAndDetermineFillPrice` Function 
 
@@ -452,7 +603,7 @@ We are using stable price mechanism just for our testnet. We will use actual USD
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/72 
 
 ## Found by 
-0xDjango, Delvir0, carrotsmuggler, crimson-rat-reach, dirk\_y, lil.eth, rogue-lion-0619
+0xDjango, Delvir0, carrotsmuggler, dirk\_y, lil.eth, rogue-lion-0619
 ## Summary
 When a user withdraws from the insurance fund, the value of their shares is calculated based on the balance of vUSD in the fund. Another user could deliberately frontrun (or frontrun by chance) the withdrawal with a call to `settleBadDebt` to significantly reduce the vUSD returned from the withdrawal with the same number of shares.
 
@@ -528,7 +679,61 @@ Best case I see for this is medium since there is potential for withdraws to be 
 
 agree with the above commnet
 
-# Issue M-5: Malicious user can control premium emissions to steal margin from other traders 
+# Issue M-5: min withdraw of 5 VUSD is not enough to prevent DOS via VUSD.sol#withdraw(amount) 
+
+Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/81 
+
+## Found by 
+0xbepresent, lil.eth, p-tsanev
+## Summary
+
+A vulnerability exists where a malicious user spam the contract with numerous withdrawal requests (e.g., 5,000). This would mean that genuine users who wish to withdraw their funds may find themselves unable to do so in a timely manner because the processing of their withdrawals could be delayed significantly.
+
+## Vulnerability Detail
+The issue stems from the fact that there is no restriction on the number of withdrawal requests a single address can make. A malicious actor could repeatedly call the withdraw or withdrawTo function, each time with a small amount (min 5 VUSD), to clog the queue with their withdrawal requests.
+```solidity
+    //E Burn vusd from msg.sender and queue the withdrawal to "to" address
+    function _withdrawTo(address to, uint amount) internal {
+        //E check min amount
+        require(amount >= 5 * (10 ** 6), "min withdraw is 5 vusd"); //E @audit-info not enough to prevent grief
+        //E burn this amount from msg.sender
+        burn(amount); // burn vusd from msg.sender
+        //E push 
+        withdrawals.push(Withdrawal(to, amount * 1e12));
+    }
+```
+Given the maxWithdrawalProcesses is set to 100, and the withdrawal processing function processWithdrawals doesn't have any parameter to process from a specific index in the queue, only the first 100 requests in the queue would be processed at a time.
+```solidity
+    uint public maxWithdrawalProcesses = 100;
+    //E create array of future withdrawal that will be executed to return
+    function withdrawalQueue() external view returns(Withdrawal[] memory queue) {
+        //E check if more than 100 requests in withdrawals array
+        uint l = _min(withdrawals.length-start, maxWithdrawalProcesses);
+        queue = new Withdrawal[](l);
+
+        for (uint i = 0; i < l; i++) {
+            queue[i] = withdrawals[start+i];
+        }
+    }
+```
+In the case of an attack, the first 100 withdrawal requests could be those of the attacker, meaning that the genuine users' requests would be stuck in the queue until all of the attacker's requests have been processed. Moreover the fact that we can only withdraw up to 1 day long when our withdraw request is good to go.
+
+## Impact
+
+This could result in significant delays for genuine users wanting to withdraw their funds, undermining the contract's usability and users' trust in the platform.
+## Code Snippet
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L88
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+Either limit number of withdrawal requests per address could be a first layer of defense even if it's not enough but I don't see the point why this limit is included so removing it could mitigate this.
+Otherwise you could implement a priority queue regarding amount to be withdrawn
+
+
+# Issue M-6: Malicious user can control premium emissions to steal margin from other traders 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/87 
 
@@ -693,7 +898,182 @@ Also, only validators can match the placed orders and the malicious user will no
 
 Changed the severity to medium
 
-# Issue M-6: Malicious users can donate/leave dust amounts of collateral in contract during auctions to buy other collateral at very low prices 
+**MarkuSchick**
+
+Escalate
+
+The market manipulation the user is referring to is a dublicate of the funding rate manipulation raised in https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183: 
+`2. Manipulation of funding rate`.
+
+According to [other comments](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1643652209) funding rate manipulation is a low severity issue.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> The market manipulation the user is referring to is a dublicate of the funding rate manipulation raised in https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183: 
+> `2. Manipulation of funding rate`.
+> 
+> According to [other comments](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1643652209) funding rate manipulation is a low severity issue.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**djb15**
+
+In my (biased) opinion I think the medium (not low) severity argument for the other issue is that you would need multiple validators to be malicious which is highly unlikely (**in a normal market environment**).
+
+In this issue **any** user can open orders to manipulate the funding rate, but this is only possible in low liquidity scenarios which is why it is a medium severity issue.
+
+A single malicious validator would be able to do the same thing as is detailed in this report in low liquidity market environments, which would make these two issues identical. Hence why I think both should be medium severity.
+
+**asquare08**
+
+As mentioned in the comment [here](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/87#issuecomment-1640419190), its a valid medium issue. Also refer to [this](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1665745210) comment
+
+**hrishibhat**
+
+Result:
+Medium
+Unique
+Considering this a valid medium issue
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [MarkuSchick](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/87/#issuecomment-1643704754): rejected
+
+# Issue M-7: Malicious user can grief withdrawing users via VUSD reentrancy 
+
+Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153 
+
+## Found by 
+0x3e84fa45, 0x52
+## Summary
+
+VUSD#processWithdraw makes a call to withdrawal.usr to send the withdrawn gas token. processWithdrawals is the only nonreentrant function allowing a user to create a smart contract that uses it's receive function to deposit then immediately withdraw to indefinitely lengthen the withdrawal queue and waste large amounts of caller gas.
+
+## Vulnerability Detail
+
+[VUSD.sol#L69-L77](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L69-L77)
+
+        while (i < withdrawals.length && (i - start) < maxWithdrawalProcesses) {
+            Withdrawal memory withdrawal = withdrawals[i];
+            if (reserve < withdrawal.amount) {
+                break;
+            }
+
+            (bool success, bytes memory data) = withdrawal.usr.call{value: withdrawal.amount}("");
+            if (success) {
+                reserve -= withdrawal.amount;
+
+To send the withdrawn gas token to the user VUSD#processWithdrawals utilizes a call with no data. When received by a contract this will trigger it's receive function. This can be abused to continually grief users who withdraw with no recurring cost to the attacker. To exploit this the attacker would withdraw VUSD to a malicious contract. This contract would deposit the received gas token then immediately withdraw it. This would lengthen the queue. Since the queue is first-in first-out a user would be forced to process all the malicious withdrawals before being able to process their own. While processing them they would inevitably reset the grief for the next user.
+
+NOTE: I am submitting this as a separate issue apart from my other two similar issues. I believe it should be a separate issue because even though the outcome is similar the root cause is entirely different. Those are directly related to the incorrect call parameters while the root cause of this issue is that both mintWithReserve and withdraw/withdrawTo lack the reentrant modifier allowing this malicious reentrancy.
+
+## Impact
+
+Malicious user can maliciously reenter VUSD to grief users via unnecessary gas wastage 
+
+## Code Snippet
+
+[VUSD.sol#L45-L48](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L45-L48)
+
+[VUSD.sol#L50-L52](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L50-L52)
+
+[VUSD.sol#L58-L60](https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/VUSD.sol#L58-L60)
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Add the nonreentrant modifer to mintWithReserve withdraw and withdrawTo
+
+
+
+## Discussion
+
+**asquare08**
+
+Will add the `nonreentrant` modifer to `mintWithReserve` withdraw and `withdrawTo`
+
+**ctf-sec**
+
+>To exploit this the attacker would withdraw VUSD to a malicious contract. This contract would deposit the received gas token then immediately withdraw it. 
+
+I put this issue and #160 together because these two issue highlight different ways of wasting gas, but they also focus on how to waste gas in external call.
+
+Recommend checking #160 as well.
+
+and I leave the #158 as a separate issue because the root cause is the returned call data is emitted in the contract code itself
+
+**asquare08**
+
+yes noted. #160 has slightly different cause but same effect. So the solution for all these related issues is
+* don't save data in variable #158 
+* cap the gas limit of .call #160
+* [this](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153#issuecomment-1640346418)
+
+
+**IAm0x52**
+
+Escalate
+
+As the sponsor has pointed out, this is a different issue from the dupes. While the outcome of wasting gas is similar, the root cause is completely different. The root cause for this is reentrancy across functions, while the root cause of issues marked as dupes is that there is no gas limit. I suggest that this issue be separated and the dupes groped together as separate issues.
+
+Edit:
+Missed #195. That and this should be considered a separate issue
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> As the sponsor has pointed out, this is a different issue from the dupes. While the outcome of wasting gas is similar, the root cause is completely different. The root cause for this is reentrancy across functions, while the root cause of issues marked as dupes is that there is no gas limit. I suggest that this issue be separated and the dupes groped together as separate issues.
+> 
+> Edit:
+> Missed #195. That and this should be considered a separate issue
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**ctf-sec**
+
+See escalation https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/116
+
+There are a lot of ways to consume all gas in external call (reentrancy to expand the queue size, gas token, for loop, swap, etc....), cannot count each of them as duplicates 
+
+I think grouping all these issue about wasting gas in external call to one issue make sense, root cause is gas limit not capped.
+
+**0xArcturus**
+
+ Agreed with escalation, 
+as also mentioned in [#195](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/195), the root cause of this is the lack of reentrancy guard and the `withdrawals.length` changing during execution. This attack can bloat the queue by reentering with a single withdraw call, while the dupes are focused on consuming gas in a single call.
+
+**hrishibhat**
+
+Result:
+Medium
+Has duplicates
+Agree with the escalation that this should be a separate issue along with #195 
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [IAm0x52](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153/#issuecomment-1643577079): accepted
+
+# Issue M-8: Malicious users can donate/leave dust amounts of collateral in contract during auctions to buy other collateral at very low prices 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/168 
 
@@ -761,7 +1141,7 @@ Close the auction if there is less than a certain threshold of a token remaining
 
 This issue can come when multi-collateral is enabled. Therefore, we will fix this with post-mainnet releases as we are launching mainnet with single collateral. 
 
-# Issue M-7: MarginAccountHelper will be bricked if registry.marginAccount or insuranceFund ever change 
+# Issue M-9: MarginAccountHelper will be bricked if registry.marginAccount or insuranceFund ever change 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/170 
 
@@ -808,7 +1188,7 @@ Remove approvals to old contracts before changing and approve new contracts afte
 
 Valid issue but we will be using `syncDeps` mainly during the deployment. Later on, since both `marginAccount` and `insuranceFund` are upgradeable contracts, their address won't change.
 
-# Issue M-8: Funding settlement will be DOS'd for a time after the phaseID change of an underlying chainlink aggregator 
+# Issue M-10: Funding settlement will be DOS'd for a time after the phaseID change of an underlying chainlink aggregator 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/177 
 
@@ -862,86 +1242,144 @@ I would recommend using a try block when calling the aggregator. If the roundID 
 
 This is a valid issue. We will fix it with post-mainnet releases because we are using trusted oracle (deployed on hubbleNet) with mainnet release and any updates to that will be notified prior.
 
-# Issue M-9: Reducing position size can also put the trader below the required margin due to fees paid 
+# Issue M-11: User will be forced liquidated 
 
-Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/201 
+Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/234 
 
 ## Found by 
-yixxas
+BugBusters
 ## Summary
-`assertMarginRequirement` of a trader is only checked after opening position if position size is increased, i.e. `varGroup.isPositionIncreased`. However, we should also be checking even when position size is reduced due to the fees that is paid.
+The `addMargin` function have a vulnerability that can potentially lead to issues when the contract is paused. Users are unable to add margin during the paused state, which can leave them vulnerable to liquidation if their collateral value falls below the required threshold. Additionally, after the contract is unpaused, users can be subject to frontrunning, where their margin addition transactions can be exploited by other users.
 
 ## Vulnerability Detail
-Fee is charged whenever a position is opened. For example, if the mode is maker, then the trader has to pay the maker fee. This means that it is possible for a trader to call `openPosition` with the intention of reducing the size of his position, his position can enter the insufficient margin state at the end of the call. 
+To better understand how this  vulnerabilities could be exploited, let's consider a scenario:
 
-```solidity
-  function _openPosition(IOrderBook.Order memory order, int256 fillAmount, uint256 fulfillPrice, IOrderBook.OrderExecutionMode mode, bool is2ndTrade) internal returns(uint openInterest) {
-        updatePositions(order.trader); // settle funding payments
-        uint quoteAsset = abs(fillAmount).toUint256() * fulfillPrice / 1e18;
-        int size;
-        uint openNotional;
-        VarGroup memory varGroup;
-        (
-            varGroup.realizedPnl,
-            varGroup.isPositionIncreased,
-            size,
-            openNotional,
-            openInterest
-        ) = amms[order.ammIndex].openPosition(order, fillAmount, fulfillPrice, is2ndTrade);
+1): The contract owner pauses the contract due to some unforeseen circumstances or for maintenance purposes.
 
-        {
-            int toFeeSink;
-            (toFeeSink, varGroup.feeCharged) = _chargeFeeAndRealizePnL(order.trader, varGroup.realizedPnl, quoteAsset, mode);
-            if (toFeeSink != 0) {
-                marginAccount.transferOutVusd(feeSink, toFeeSink.toUint256());
-            }
-        }
-        {
-            // isPositionIncreased is true when the position is increased or reversed
-            if (varGroup.isPositionIncreased) {
-                assertMarginRequirement(order.trader);
-                require(order.reduceOnly == false, "CH: reduceOnly order can only reduce position");
-            }
-            emit PositionModified(order.trader, order.ammIndex, fillAmount, fulfillPrice, varGroup.realizedPnl, size, openNotional, varGroup.feeCharged, mode, _blockTimestamp());
-        }
-    }
-```
+2): During the paused state, User A wants to add margin to their account. However, they are unable to do so since the contract prohibits margin addition while paused.
+
+3): Meanwhile, the price of the collateral supporting User A's account experiences significant fluctuations, causing the value of their collateral to fall below the required threshold for maintenance.
+
+4): While the contract is still paused, User A's account becomes eligible for liquidation.
+
+5): After some time, the contract owner decides to unpause the contract, allowing normal operations to resume.
+
+6): User A tries to add margin to their account after the contract is unpaused. However, before their transaction is processed, User B, who has been monitoring the pending transactions, notices User A's margin addition transaction and quickly frontruns it by submitting a higher gas price transaction to liquidate User A's account instead.
+
+Now userA will be forcefully liquidated even tho he wants to add the margin.
+
+You can read more from [this link](https://dacian.me/lending-borrowing-defi-attacks#heading-borrower-immediately-liquidated-after-repayments-resume)
 
 ## Impact
-Trader can fall below the margin requirement after reducing his position size.
+
+The identified impact could be
+
+1): Unfair Liquidations: Users can be unfairly liquidated if their margin addition transactions are frontrun by other users after the contract is unpaused. This can result in the loss of their collateral.
 
 ## Code Snippet
-https://github.com/hubble-exchange/hubble-protocol/blob/3a6b576eeedc323c70feb3808c665228e5f9b8a5/contracts/ClearingHouse.sol#L140-L169
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/MarginAccount.sol#L136-L156
 
 ## Tool used
 
 Manual Review
 
 ## Recommendation
-`assertMarginRequirement(order.trader)` should be moved out of the `if (varGroup.isPositionIncreased)` scope to ensure that trader has the required margin after reducing position size.
+Implement a Fair Liquidation Mechanism: Introduce a delay or waiting period before executing liquidation transactions. This waiting period should provide sufficient time for users to address their collateral issues or add margin. 
 
 
 
 ## Discussion
 
-**asquare08**
+**Nabeel-javaid**
 
-We are allowing reducing of a position even when a position is underwater. That way, traders will have a chance to close/reduce their position before getting liquidated (and charged a liquidation fee). So if a trader falls into the liquidation zone because of the fee paid while reducing the position, they'll still have a chance to reduce their position further, or else 25% of their position will be liquidated.
+escalate for 10 USDC
+
+I think this issue should be considered as valid. The validity of issue should be accepted. The report clearly shows how a protocol owner actions (pause) will result in unfair liquidations causing loss of funds to users.
+
+Also it is unlikely that on unpause human users will be able to secure their positions before MEV/liquidation bots capture the available profit. Hence the loss is certain.
+
+For reference, similar issues were consider valid in the recent contests on sherlock, you can check it [here](https://github.com/sherlock-audit/2023-03-notional-judging/issues/203) and [here](https://github.com/sherlock-audit/2023-05-perennial-judging/issues/190). Maintaining a consistent valid/invalid classification standard will be ideal here.
+
+**sherlock-admin2**
+
+ > escalate for 10 USDC
+> 
+> I think this issue should be considered as valid. The validity of issue should be accepted. The report clearly shows how a protocol owner actions (pause) will result in unfair liquidations causing loss of funds to users.
+> 
+> Also it is unlikely that on unpause human users will be able to secure their positions before MEV/liquidation bots capture the available profit. Hence the loss is certain.
+> 
+> For reference, similar issues were consider valid in the recent contests on sherlock, you can check it [here](https://github.com/sherlock-audit/2023-03-notional-judging/issues/203) and [here](https://github.com/sherlock-audit/2023-05-perennial-judging/issues/190). Maintaining a consistent valid/invalid classification standard will be ideal here.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
 
 **ctf-sec**
 
-Emm I will leave this as a medium because there maybe case when liquidation comes in before user have a chance to reduce their position because of the issue highlighted in the report
+I mean if the liquidation cannot be paused then clearly a medium (there are similar past finding)
 
-**asquare08**
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/1f9a5ed0ca8f6004bbb7b099ecbb8ae796557849/hubble-protocol/contracts/MarginAccount.sol#L322
 
-yes. confirmed
+```solidity
+    function liquidateExactRepay(address trader, uint repay, uint idx, uint minSeizeAmount) external whenNotPaused {
+```
 
-# Issue M-10: No `minAnswer/maxAnswer` Circuit Breaker Checks while Querying Prices in Oracle.sol 
+But The liquidation is paused as well
+
+so recommend severity is low
+
+a optional fix is adding a grace period for user to add margin when unpause the liquidation and addMargin
+
+
+**Nabeel-javaid**
+
+Hey @ctf-sec 
+Adding more context, the problem is not that the liquidation functions can be paused or not, it is more of a front-running problem.
+
+Liquidation functions cannot be paused individually, whole contract is paused which means that other functions with the whenNotPaused modifier cannot be accessed either.
+
+So when the contract is un-paused, a user can be front-run before making the position healthy and is unfairly liquidated. For more reference see the following issue that are exactly the same .
+
+[Perrenial Contest Issue 190](https://github.com/sherlock-audit/2023-05-perennial-judging/issues/190)
+[Notional Contest Issue 203](https://github.com/sherlock-audit/2023-03-notional-judging/issues/203)
+
+I hope that added context will further help in judging.
+
+**hrishibhat**
+
+@ctf-sec 
+I understand this is how it is design but there is a loss due front-run during unpause. 
+
+**ctf-sec**
+
+https://github.com/sherlock-audit/2023-04-blueberry-judging/issues/118
+
+seems like this issue has been historically judged as a medium
+
+then a medium is fine
+
+**hrishibhat**
+
+Result:
+Medium
+Unique
+After further discussions with Lead Watson and Sponsor, considering this a valid medium based on the above comments
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [Nabeel-javaid](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/234/#issuecomment-1642504725): accepted
+
+# Issue M-12: No `minAnswer/maxAnswer` Circuit Breaker Checks while Querying Prices in Oracle.sol 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/241 
 
 ## Found by 
-Bauchibred, BugBusters, Hama, crimson-rat-reach, rogue-lion-0619
+Bauchibred, BugBusters, Hama, crimson-rat-reach, ni8mare, rogue-lion-0619
 
 
 ## Summary
@@ -1002,9 +1440,230 @@ Since there is going to be a whitelist of tokens to be added, the minPrice/maxPr
 
 
 
+
 ## Discussion
 
 **asquare08**
 
 This is a valid concern. But we will fix this in later releases as initially, we are launching with blue chip tokens only and single collateral (USDC).  
+
+# Issue M-13: Potential accounting problems due to issue in `ClearingHouse.updatePositions()` 
+
+Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/248 
+
+## Found by 
+lemonmon
+## Summary
+
+Potential issue in `ClearingHouse.updatePositions()` when lastFundingTime is not being updated by `ClearingHouse.settleFunding`.
+
+## Vulnerability Detail
+
+`ClearingHouse.lastFundingTime` is only updated, when `_nextFundingTime` is not zero:
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L281-L282
+
+`_nextFundingTime` is determined a few lines above by a call to `amms[i].settleFunding()`:
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L267
+
+The return value of `amms[i].settleFunding()` can be zero for `_nextFundingTime`, if the `block.timestamp` is smaller than the next funding time:
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/AMM.sol#L236-L249
+
+That means that if the last market inside the `amms` array has not reached the next funding time at `block.timestamp`, `_nextFundingTime` will be zero and `lastFundingTime` will not be updated.
+
+Then when `ClearingHouse.updatePositions()` is called, it will not process `fundingPayment` because `lastFundingTime` was not updated:
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L241-L250
+
+## Impact
+
+Unrealized funding payments are not settled correctly, potentially leading to incorrect margin accounting when opening a position. Also `marginAccount.realizePnL()` (line 255 ClearingHouse.sol) won't get called, so the trader won't receive funds that they should receive.
+
+Note: `ClearingHouse.updatePositions()` is called by `ClearingHouse._openPosition` (line 141 ClearingHouse.sol).
+
+Note: `ClearingHouse.liquidate` -> `ClearingHouse.openPosition` -> `ClearingHouse._openPosition`
+
+There can be multiple potential issues with accounting that can result due to this issue, both when liquidating and when opening a position.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L281-L282
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L267
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/AMM.sol#L236-L249
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L241-L250
+
+https://github.com/sherlock-audit/2023-04-hubble-exchange/blob/main/hubble-protocol/contracts/ClearingHouse.sol#L140-L141
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Consider adjusting the code inside `ClearingHouse.settleFunding()` to account for the case where the last market inside the `amms` array returns zero for `_nextFundingTime` when `Amm.settleFunding()` is called (line 267 ClearingHouse.sol). For example introduce a boolean variable that tracks whether a market inside `amms` array didn't return zero for `_nextFundingTime`.
+
+```solidity
+// ClearingHouse
+// settleFunding
+268            if (_nextFundingTime != 0) {
+269                _marketReachedNextFundingTime = true; // <-- @audit new boolean to track
+
+281        if (_marketReachedNextFundingTime) {
+282            lastFundingTime = _blockTimestamp();
+283        }
+```
+
+
+
+## Discussion
+
+**asquare08**
+
+All amms will have the same `nextFundingTime` as `amm.settleFunding` is called together for all amms in a single tx. So _nextFundingTime will either be 0 or none for all amms.
+```solidity
+    function settleFunding() override external onlyDefaultOrderBook {
+        uint numAmms = amms.length;
+        uint _nextFundingTime;
+        for (uint i; i < numAmms; ++i) {
+            int _premiumFraction;
+            int _underlyingPrice;
+            int _cumulativePremiumFraction;
+            (_premiumFraction, _underlyingPrice, _cumulativePremiumFraction, _nextFundingTime) = amms[i].settleFunding();
+            if (_nextFundingTime != 0) {
+                emit FundingRateUpdated(
+                    i,
+                    _premiumFraction,
+                    _underlyingPrice.toUint256(),
+                    _cumulativePremiumFraction,
+                    _nextFundingTime,
+                    _blockTimestamp(),
+                    block.number
+                );
+            }
+        }
+        // nextFundingTime will be same for all amms
+        if (_nextFundingTime != 0) {
+            lastFundingTime = _blockTimestamp();
+        }
+    }
+   
+
+
+**ctf-sec**
+
+Closed this issue based on sponsor's comment,
+
+the watson is welcome to escalate with a more clear impact and more proof
+
+**lemonmon1984**
+
+Escalate
+> All amms will have the same nextFundingTime as amm.settleFunding is called together for all amms in a single tx.
+
+It is not neccessarily true for certain conditions, in which ClearingHouse.whitelistAmm() is involved.
+One possible scenario would be:
+1. A couple of AMMs are whitelisted via ClearingHouse.whitelistAmm() where a nextFundingTime is assigned to them.
+1. After the nextFundingTime was reached, ClearingHouse.whitelistAmm() is called again to add another AMM.
+1. Then the ClearingHouse.settleFunding() is called and returns 0 for the last AMM that was just added in the previous step, because its nextFundingTime is in the future and ClearingHouse.sol line 248 is true and returns 0 for nextFundingTime, which then leads to the issue described here.
+
+Note: ClearingHouse.whitelistAmm() and ClearingHouse.settleFunding() is likely to be initiated by separate entities. Therefore, the order of transactions is not guaranteed. Also the tx execution can be delayed due to network congestions. That's why this scenario may occur.
+
+**Example:**
+
+fundingPeriod: 3h
+call ClearingHouse.whitelistAmm():  at 16:00 (block.timestamp)
+
+then AMM.startFunding()  gets called l521 in ClearingHouse.sol
+    here it calculates:
+        nextFundingTime = ((16 + 3) / 3) * 3 = 18
+
+
+at 19:00 another AMM is added:
+    call ClearingHouse.whitelistAmm():  at 19:00 (block.timestamp)
+    then AMM.startFunding()  gets called l521 in ClearingHouse.sol
+        here it calculates:
+            nextFundingTime = ((19 + 3) / 3) * 3 = 21
+
+then also at 19:00 after another AMM was just added:
+    call ClearingHouse.settleFunding()
+        which calls AMM.settleFunding, and the last index of AMMs contains the added AMM from 19:00 with nextFundingTime 21
+            so AMM.settleFunding will return 0,0,0,0 l249 because nextFundingTime is in the future.
+                This leads to exactly the issue described that then on line 281 in ClearingHouse.sol _nextFundingTime will be 0.
+
+
+### Other scenario
+In another scenario, if the ClearingHouse.settleFunding() is called past the nextFundingTime due to network congestion,
+the nextFundingTime will shift from the fixed schedule. While it is shifted, if the ClearingHouse.whitelistAmm() is called, then it gives a certain window for the ClearingHouse.settleFunding() call will face the same issue.
+
+**sherlock-admin2**
+
+ > Escalate
+> > All amms will have the same nextFundingTime as amm.settleFunding is called together for all amms in a single tx.
+> 
+> It is not neccessarily true for certain conditions, in which ClearingHouse.whitelistAmm() is involved.
+> One possible scenario would be:
+> 1. A couple of AMMs are whitelisted via ClearingHouse.whitelistAmm() where a nextFundingTime is assigned to them.
+> 1. After the nextFundingTime was reached, ClearingHouse.whitelistAmm() is called again to add another AMM.
+> 1. Then the ClearingHouse.settleFunding() is called and returns 0 for the last AMM that was just added in the previous step, because its nextFundingTime is in the future and ClearingHouse.sol line 248 is true and returns 0 for nextFundingTime, which then leads to the issue described here.
+> 
+> Note: ClearingHouse.whitelistAmm() and ClearingHouse.settleFunding() is likely to be initiated by separate entities. Therefore, the order of transactions is not guaranteed. Also the tx execution can be delayed due to network congestions. That's why this scenario may occur.
+> 
+> **Example:**
+> 
+> fundingPeriod: 3h
+> call ClearingHouse.whitelistAmm():  at 16:00 (block.timestamp)
+> 
+> then AMM.startFunding()  gets called l521 in ClearingHouse.sol
+>     here it calculates:
+>         nextFundingTime = ((16 + 3) / 3) * 3 = 18
+> 
+> 
+> at 19:00 another AMM is added:
+>     call ClearingHouse.whitelistAmm():  at 19:00 (block.timestamp)
+>     then AMM.startFunding()  gets called l521 in ClearingHouse.sol
+>         here it calculates:
+>             nextFundingTime = ((19 + 3) / 3) * 3 = 21
+> 
+> then also at 19:00 after another AMM was just added:
+>     call ClearingHouse.settleFunding()
+>         which calls AMM.settleFunding, and the last index of AMMs contains the added AMM from 19:00 with nextFundingTime 21
+>             so AMM.settleFunding will return 0,0,0,0 l249 because nextFundingTime is in the future.
+>                 This leads to exactly the issue described that then on line 281 in ClearingHouse.sol _nextFundingTime will be 0.
+> 
+> 
+> ### Other scenario
+> In another scenario, if the ClearingHouse.settleFunding() is called past the nextFundingTime due to network congestion,
+> the nextFundingTime will shift from the fixed schedule. While it is shifted, if the ClearingHouse.whitelistAmm() is called, then it gives a certain window for the ClearingHouse.settleFunding() call will face the same issue.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**asquare08**
+
+A good corner case is described. It's a valid issue and can be marked as medium severity 
+
+**IAm0x52**
+
+Agreed with escalation, valid corner case
+
+**hrishibhat**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [lemonmon1984](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/248/#issuecomment-1642709772): accepted
 
