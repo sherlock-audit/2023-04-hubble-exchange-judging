@@ -166,6 +166,18 @@ Escalations have been resolved successfully!
 Escalation status:
 - [p12473](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/116/#issuecomment-1643012093): accepted
 
+**asquare08**
+
+Fixed in [this PR](https://github.com/hubble-exchange/hubble-protocol/pull/186). The description is in the PR.
+
+**IAm0x52**
+
+Fix looks good. The `call` in `processWithdrawals` now limits gas consumption to `maxGas` which can be adjusted by governance. A optional change I would recommend is to prevent `maxGas` from being set to less than 3000 in the event that admin is compromised in some way.
+
+**asquare08**
+
+Yes. Good suggestion. Will add this with upcoming fixes. 
+
 # Issue H-2: Failed withdrawals from VUSD#processWithdrawals will be lost forever 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/162 
@@ -213,6 +225,14 @@ Cache failed withdrawals and allow them to be retried or simply send VUSD to the
 **asquare08**
 
 will add functionality to retry withdrawals
+
+**asquare08**
+
+Fixed in [this PR](https://github.com/hubble-exchange/hubble-protocol/pull/186). The description is in the PR.
+
+**IAm0x52**
+
+Fix looks good. Failed withdrawals are cached allowing them to be retried by governance on a case by case basis.
 
 # Issue H-3: Rogue validators can manipulate funding rates and profit unfairly from liquidations 
 
@@ -413,6 +433,10 @@ Escalations have been resolved successfully!
 Escalation status:
 - [p12473](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183/#issuecomment-1642958328): rejected
 
+**asquare08**
+
+As mentioned in the above [comment](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183#issuecomment-1640336635), we will fix this in later releases
+
 # Issue M-1: Risk of Unfair Order Execution Price in `_validateOrdersAndDetermineFillPrice` Function 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/8 
@@ -509,6 +533,10 @@ https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/183
 Yes correct validator can extract MEV from this by opening longs at better price everytime. Changed status to confirmed. 
 FYI: Fill price determination happens through precompile now and long order is executed as taker and short as maker (maker fee is less than taker fee). So long will get better price but pay more fee and short order will execute at order price but pay less fee
 
+**asquare08**
+
+We'll be launching with a trusted set of validators. So, we'll fix this in later releases when we allow anyone to become a validator. 
+
 # Issue M-2: `Chainlink.latestRoundData()` may return stale results 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/18 
@@ -557,6 +585,14 @@ require(block.timestamp - udpatedData < toleranceTime, "stale price");
 
 will add a tolerance time equal to the max update time of the price feed.
 
+**asquare08**
+
+Fixed in [this PR](https://github.com/hubble-exchange/hubble-protocol/pull/186). The description is in the PR.
+
+**IAm0x52**
+
+Fix looks good. `chainLinkAggregatorMap` now stores a struct which contains the oracle address and the heartbeat. `getUnderlyingPrice` will now revert if price update is outside of heartbeat window
+
 # Issue M-3: Setting stable price in oracle can result in arbitrate opportunities and significant bad debt if the stable depegs 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/69 
@@ -597,6 +633,18 @@ I would recommend not having the option to manually set and read the price of a 
 **asquare08**
 
 We are using stable price mechanism just for our testnet. We will use actual USDC price for the mainnet.
+
+**asquare08**
+
+As mentioned in the above comment, there is no change required for this in contracts. We'll set stable price for usdc to 0 to use oracle price feeds for usdc.
+
+**IAm0x52**
+
+No fix needed in the current contract. Mainnet deployment will use oracle feed for USDC
+
+**MLON33**
+
+No fix will be made so Sherlock considers this issue to be acknowledged by the protocol team.
 
 # Issue M-4: Malicious user can frontrun withdrawals from Insurance Fund to significantly decrease value of shares 
 
@@ -679,6 +727,10 @@ Best case I see for this is medium since there is potential for withdraws to be 
 
 agree with the above commnet
 
+**asquare08**
+
+As this case arises only in case of multi-collateral, we will fix this in later releases 
+
 # Issue M-5: min withdraw of 5 VUSD is not enough to prevent DOS via VUSD.sol#withdraw(amount) 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/81 
@@ -732,6 +784,14 @@ Manual Review
 Either limit number of withdrawal requests per address could be a first layer of defense even if it's not enough but I don't see the point why this limit is included so removing it could mitigate this.
 Otherwise you could implement a priority queue regarding amount to be withdrawn
 
+
+
+
+## Discussion
+
+**asquare08**
+
+Since this is a temporary DOS, we will increase `maxWithdrawalProcesses` if such a condition arises or increase the min withdrawal amount to increase the capital requirement to do so.
 
 # Issue M-6: Malicious user can control premium emissions to steal margin from other traders 
 
@@ -1073,6 +1133,14 @@ Escalations have been resolved successfully!
 Escalation status:
 - [IAm0x52](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/153/#issuecomment-1643577079): accepted
 
+**asquare08**
+
+Fixed in [this PR](https://github.com/hubble-exchange/hubble-protocol/pull/186). The description is in the PR.
+
+**IAm0x52**
+
+Fix looks good. `mintWithReserve`, `withdraw`, and `withdrawTo` now use the `nonreentrant` modifier to prevent this exploit
+
 # Issue M-8: Malicious users can donate/leave dust amounts of collateral in contract during auctions to buy other collateral at very low prices 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/168 
@@ -1374,6 +1442,10 @@ Escalations have been resolved successfully!
 Escalation status:
 - [Nabeel-javaid](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/234/#issuecomment-1642504725): accepted
 
+**asquare08**
+
+This issue has more chances of occurrence when there are volatile assets as collateral. As we are launching with single collateral (USDC) initially, we'll fix this later.
+
 # Issue M-12: No `minAnswer/maxAnswer` Circuit Breaker Checks while Querying Prices in Oracle.sol 
 
 Source: https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/241 
@@ -1446,6 +1518,12 @@ Since there is going to be a whitelist of tokens to be added, the minPrice/maxPr
 **asquare08**
 
 This is a valid concern. But we will fix this in later releases as initially, we are launching with blue chip tokens only and single collateral (USDC).  
+
+**asquare08**
+
+As mentioned in this [comment](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/241#issuecomment-1640177179), we'll fix this later.
+
+
 
 # Issue M-13: Potential accounting problems due to issue in `ClearingHouse.updatePositions()` 
 
@@ -1666,4 +1744,8 @@ Escalations have been resolved successfully!
 
 Escalation status:
 - [lemonmon1984](https://github.com/sherlock-audit/2023-04-hubble-exchange-judging/issues/248/#issuecomment-1642709772): accepted
+
+**asquare08**
+
+Whitelist amm is governance function, we'll take care that when whitelisting new amm, all amms should have same `nextFundingTime`
 
